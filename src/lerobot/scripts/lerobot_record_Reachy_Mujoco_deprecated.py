@@ -130,6 +130,11 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
+import threading  
+from lerobot.scripts.scripted_control import ScriptedEventListener  
+from lerobot.src.lerobot.scripts.task import run_scripted_task  
+from lerobot.teleoperators.reachy2_teleoperator import Reachy2Teleoperator
+
 @dataclass
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
@@ -445,11 +450,45 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     if teleop is not None:
         teleop.connect()
 
-    listener, events = init_keyboard_listener()
+    is_scripted_mode = (
+        isinstance(teleop, Reachy2Teleoperator) and 
+        hasattr(cfg.robot, "use_external_commands") and 
+        cfg.robot.use_external_commands is False
+    )
+
+    if is_scripted_mode:
+        logging.info("Mode d'enregistrement scripté détecté (Reachy2 + use_external_commands=False).")
+        if not (hasattr(cfg.teleop, "use_present_position") and cfg.teleop.use_present_position is False):
+            logging.warning("Pour le mode scripté, '--teleop.use_present_position=false' est requis pour lire les 'goal_positions'.")
+            
+        event_listener = ScriptedEventListener()
+        events = event_listener.events
+        listener = None # Pas de listener clavier
+    else:
+        logging.info("Mode d'enregistrement manuel détecté. Utilisation du clavier.")
+        listener, events = init_keyboard_listener()
+
+    task_thread = None
+    if is_scripted_mode:
+        num_episodes_to_run = cfg.dataset.num_episodes - dataset.num_episodes if cfg.resume else cfg.dataset.num_episodes
+        
+        task_thread = threading.Thread(
+            target=run_scripted_task,
+            args=(
+                teleop.reachy, # On passe l'objet SDK du téléopérateur
+                event_listener,
+                num_episodes_to_run,
+                cfg.dataset.reset_time_s # On passe le temps de reset
+            ),
+            daemon=True
+        )
+        task_thread.start()
 
     with VideoEncodingManager(dataset):
         recorded_episodes = 0
-        while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+
+        num_episodes_to_run = cfg.dataset.num_episodes - dataset.num_episodes if cfg.resume else cfg.dataset.num_episodes
+        while recorded_episodes < num_episodes_to_run and not events["stop_recording"]:
             log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
             record_loop(
                 robot=robot,
@@ -471,7 +510,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             # Execute a few seconds without recording to give time to manually reset the environment
             # Skip reset for the last episode to be recorded
             if not events["stop_recording"] and (
-                (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                (recorded_episodes < num_episodes_to_run - 1) or events["rerecord_episode"]
             ):
                 log_say("Reset the environment", cfg.play_sounds)
                 record_loop(
@@ -481,7 +520,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     teleop_action_processor=teleop_action_processor,
                     robot_action_processor=robot_action_processor,
                     robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
+                    teleop=teleop if not is_scripted_mode else None,
                     control_time_s=cfg.dataset.reset_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
@@ -493,11 +532,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 events["exit_early"] = False
                 dataset.clear_episode_buffer()
                 continue
+            if is_scripted_mode:
+                event_listener.ready_for_next_episode.clear()
 
             dataset.save_episode()
             recorded_episodes += 1
 
+            if is_scripted_mode:
+                event_listener.signal_ready()
+
     log_say("Stop recording", cfg.play_sounds, blocking=True)
+    
+    if task_thread is not None:
+        task_thread.join(timeout=2.0) # Attendre que le thread de tâche finisse
 
     robot.disconnect()
     if teleop is not None:
